@@ -1,0 +1,128 @@
+from scapy.all import sniff
+import csv
+import time
+import pandas as pd
+import matplotlib
+matplotlib.use('TkAgg')  # MacOS’ta grafik penceresi açılmazsa diye eklendim
+import matplotlib.pyplot as plt
+import statistics
+from collections import defaultdict
+
+packet_count = 0
+packet_sizes = []
+
+# Zaman bazlı IP izleme için
+ip_zaman_listesi = defaultdict(list)
+uyarilmis_ipler = set()
+ZAMAN_ESIGI = 5       # saniye
+PAKET_ESIGI = 10      # 10'dan fazla istek
+
+# CSV başlat
+with open("trafik_log.csv", mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow([
+        "Timestamp", "IP Source", "IP Destination",
+        "Source Port", "Destination Port", "Protocol",
+        "Packet Size", "Etiket", "Aşırı İstek Yapan IP"
+    ])
+
+# Ortalama ve sapma başta boş
+ortalama = None
+sapma = None
+
+def örnekle(paket):
+    if paket.haslayer('IP') and paket.haslayer('TCP'):
+        boyut = len(paket)
+        packet_sizes.append(boyut)
+
+print("🟡 Ortalama ve sapma belirleniyor...")
+sniff(filter="tcp", prn=örnekle, store=0)
+
+ortalama = statistics.mean(packet_sizes)
+sapma = statistics.stdev(packet_sizes)
+alt_sınır = ortalama - 1.5 * sapma
+üst_sınır = ortalama + 1.5 * sapma
+
+print(f" Ortalama: {ortalama:.2f} | Std Sapma: {sapma:.2f}")
+print(f" Normal Aralık: {alt_sınır:.2f} - {üst_sınır:.2f}")
+
+def karar_ver(boyut):
+    if boyut < alt_sınır or boyut > üst_sınır:
+        return "Anormal"
+    return "Normal"
+
+def yakala(paket):
+    global packet_count
+    if paket.haslayer('IP') and paket.haslayer('TCP'):
+        packet_count += 1
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+        src_ip = paket['IP'].src
+        dst_ip = paket['IP'].dst
+        sport = paket['TCP'].sport
+        dport = paket['TCP'].dport
+        protokol = "TCP"
+        boyut = len(paket)
+        etiket = karar_ver(boyut)
+
+        # 5 saniyede 10'dan fazla istek kontrolü
+        şimdi = time.time()
+        ip_zaman_listesi[src_ip].append(şimdi)
+        ip_zaman_listesi[src_ip] = [t for t in ip_zaman_listesi[src_ip] if şimdi - t <= ZAMAN_ESIGI]
+
+        if len(ip_zaman_listesi[src_ip]) > PAKET_ESIGI and src_ip not in uyarilmis_ipler:
+            print(f"\n⚠️ {ZAMAN_ESIGI} sn içinde {PAKET_ESIGI}+ istek gönderen IP: {src_ip}")
+            uyarilmis_ipler.add(src_ip)
+
+        asiri_ip_flag = "TRUE" if src_ip in uyarilmis_ipler else "FALSE"
+
+        # her çıktıyı yeni satıra yaz
+        if asiri_ip_flag == "TRUE":
+            print(f"⚠️ {src_ip} → {dst_ip} | Boyut: {boyut} | Etiket: {etiket} | Aşırı İstek Yapan IP | Toplam: {packet_count}")
+        else:
+            print(f"{src_ip} → {dst_ip} | Boyut: {boyut} | Etiket: {etiket} | Toplam: {packet_count}")
+
+        with open("trafik_log.csv", mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                timestamp, src_ip, dst_ip, sport, dport,
+                protokol, boyut, etiket, asiri_ip_flag
+            ])
+
+# Başlat
+print("\n🟢 Dinleme başladı. Ctrl+C ile durdurabilirsiniz.")
+try:
+    sniff(filter="tcp", prn=yakala, store=0)
+except KeyboardInterrupt:
+    print("\n⛔ Dinleme durduruldu. Analiz başlatılıyor...")
+
+df = pd.read_csv("trafik_log.csv")
+print("\n\n📄 İlk 5 veri:\n", df.head())
+
+if 'Packet Size' in df.columns and not df['Packet Size'].empty:
+    df['Packet Size'].plot(kind='hist', bins=50, alpha=0.75)
+    plt.title('Packet Size Distribution')
+    plt.xlabel('Packet Size (bytes)')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    plt.show()
+else:
+    print("⚠️ 'Packet Size' sütunu bulunamadı veya veri yok.")
+
+print("\n📊 İstatistiksel Analiz")
+
+print(f"\n• Toplam Yakalanan Paket: {len(df)}")
+
+if 'Protocol' in df.columns:
+    print("\n• Protokol Dağılımı:")
+    print(df['Protocol'].value_counts(normalize=True).map(lambda x: f"%{round(x*100, 2)}"))
+else:
+    print("⚠️ 'Protocol' sütunu bulunamadı.")
+
+if 'Packet Size' in df.columns:
+    print(f"\n• Ortalama Paket Boyutu: {round(df['Packet Size'].mean(), 2)} byte")
+    print(f"• En Büyük Paket: {df['Packet Size'].max()} byte")
+    print(f"• En Küçük Paket: {df['Packet Size'].min()} byte")
+    print("\n• Protokole Göre Ortalama Paket Boyutu:")
+    print(df.groupby("Protocol")["Packet Size"].mean().round(2))
+else:
+    print("'Packet Size' sütunu bulunamadı.")
