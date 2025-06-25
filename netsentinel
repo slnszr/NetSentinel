@@ -1,0 +1,163 @@
+from scapy.all import sniff
+import csv
+import time
+import pandas as pd
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import statistics
+from collections import defaultdict
+
+# Paket Yakalama & Etiketleme 
+
+packet_count = 0
+packet_sizes = []
+
+ip_zaman_listesi = defaultdict(list)
+uyarilmis_ipler = set()
+ZAMAN_ESIGI = 5
+PAKET_ESIGI = 10
+
+# Trafik log CSV başlığı
+with open("trafik_log.csv", "w", newline="") as f:
+    csv.writer(f).writerow([
+        "Timestamp", "IP Source", "IP Destination",
+        "Source Port", "Destination Port", "Protocol",
+        "Packet Size", "Etiket"
+    ])
+
+# Örnekleme: Ortalama ve standart sapma
+def örnekle(p):
+    if p.haslayer('IP') and p.haslayer('TCP'):
+        packet_sizes.append(len(p))
+
+print("🟡 Ortalama ve sapma belirleniyor...")
+sniff(filter="tcp", prn=örnekle, store=0, count=50)
+
+ortalama = statistics.mean(packet_sizes)
+sapma = statistics.stdev(packet_sizes)
+alt = ortalama - 1.5 * sapma
+üst = ortalama + 1.5 * sapma
+
+print(f" Ortalama: {ortalama:.2f}, Std Sapma: {sapma:.2f}")
+print(f" Normal aralık: {alt:.2f} – {üst:.2f}")
+
+def karar_ver(size):
+    return "Anormal" if size < alt or size > üst else "Normal"
+
+def yakala(p):
+    global packet_count
+    if p.haslayer('IP') and p.haslayer('TCP'):
+        packet_count += 1
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+        src = p['IP'].src; dst = p['IP'].dst
+        sp, dp = p['TCP'].sport, p['TCP'].dport
+        size = len(p)
+        label = karar_ver(size)
+
+        # 5 saniyede PAKET_ESIGI'dan fazla istek tespiti
+        now = time.time()
+        lst = ip_zaman_listesi[src]
+        lst.append(now)
+        ip_zaman_listesi[src] = [t for t in lst if now - t <= ZAMAN_ESIGI]
+        if len(ip_zaman_listesi[src]) > PAKET_ESIGI and src not in uyarilmis_ipler:
+            print(f"\f⚠️ {ZAMAN_ESIGI}s içinde {PAKET_ESIGI}+ istek: {src}")
+            uyarilmis_ipler.add(src)
+
+        print(f"{src}→{dst} | Boyut: {size} | Etiket: {label} | Toplam: {packet_count}")
+
+        with open("trafik_log.csv", "a", newline="") as f:
+            csv.writer(f).writerow([ts, src, dst, sp, dp, "TCP", size, label])
+
+print("🟢 Dinleme başladı. Ctrl+C ile durdurulabilirsiniz.")
+try:
+    sniff(filter="tcp", prn=yakala, store=0)
+except KeyboardInterrupt:
+    print("⛔ Dinleme durduruldu.")
+
+# Veri Analizi ve Görselleştirme 
+
+df = pd.read_csv("trafik_log.csv")
+print("\n📄 İlk 5 veri:\n", df.head())
+
+if not df.empty:
+    df['Packet Size'].plot.hist(bins=50, alpha=0.7)
+    plt.title("Packet Size Distribution")
+    plt.xlabel("Size (bytes)")
+    plt.ylabel("Frequency")
+    plt.grid()
+    plt.show()
+
+    print("\n📊 Temel İstatistikler:")
+    print(f"Toplam paket: {len(df)}")
+    print(df['Protocol'].value_counts(normalize=True).mul(100).round(2).astype(str) + "%")
+    print(df.groupby("Protocol")["Packet Size"].agg(['mean','min','max']).round(2))
+else:
+    print("⚠️ Veri yok.")
+
+#  Supervised ML: Random Forest Eğitimi & Değerlendirme 
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing    import StandardScaler
+from sklearn.ensemble         import RandomForestClassifier
+from sklearn.metrics          import accuracy_score, classification_report
+
+X = df[["Packet Size", "Source Port", "Destination Port"]]
+y = df["Etiket"].map({"Normal":0, "Anormal":1})
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
+)
+
+scaler = StandardScaler().fit(X_train)
+X_train_s = scaler.transform(X_train)
+X_test_s  = scaler.transform(X_test)
+
+param_grid = {"n_estimators":[50,100], "max_depth":[None,10,20]}
+rf         = RandomForestClassifier(random_state=42)
+grid       = GridSearchCV(
+    rf,
+    param_grid,
+    cv=5,
+    scoring="accuracy",
+    n_jobs=-1,
+    error_score=0
+)
+grid.fit(X_train_s, y_train)
+
+best = grid.best_estimator_
+y_pred = best.predict(X_test_s)
+
+print(f"\n🏆 En iyi parametreler: {grid.best_params_}")
+print(f"🔍 Accuracy: {accuracy_score(y_test, y_pred):.4f}\n")
+print("📝 RF Classification Report:")
+print(classification_report(
+    y_test, y_pred,
+    labels=[0,1],
+    target_names=["Normal","Anormal"],
+    zero_division=0
+))
+
+# Unsupervised ML: IsolationForest ile Anomali Tespiti
+
+from sklearn.ensemble import IsolationForest
+
+X_all = df[["Packet Size","Source Port","Destination Port"]]
+
+iso = IsolationForest(contamination=0.01, random_state=42)
+iso.fit(X_all[df["Etiket"] == "Normal"])
+
+df["IF_Pred"]  = iso.predict(X_all)
+df["IF_Label"] = df["IF_Pred"].map({1:"Normal", -1:"Anormal"})
+
+print("\n🌀 IsolationForest Anomali Tespiti Sonuçları:")
+print(classification_report(
+    df["Etiket"],
+    df["IF_Label"],
+    labels=["Normal","Anormal"],
+    target_names=["Normal","Anormal"],
+    zero_division=0
+))
+
+counts = df["IF_Label"].value_counts()
+print("\n🔢 IsolationForest çıktı sayıları:\n", counts)
